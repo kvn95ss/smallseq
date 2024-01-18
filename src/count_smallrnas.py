@@ -24,6 +24,9 @@ def bam_to_windows(inbam):
 	read2overlapCoords=defaultdict(list)
 
 	for read in inbamPysamObj:
+		# Declare midpos as global variable, else midpos value is not assigned correctly
+		# Which leads to 0 annotated counts
+		global midpos
 		readname = read.qname
 		tid = read.rname
 		readchr  = inbamPysamObj.getrname(tid)
@@ -132,5 +135,12 @@ if '__main__' == __name__:
 		if not os.path.exists(path_outbam): safe_mkdir(path_outbam)
 
 	### call function in parallel 
-	Parallel(n_jobs=o.numCPU)(delayed(bam_to_windows)(sample) for sample in samplenames_with_fullpath)
-
+	#Parallel(n_jobs=o.numCPU)(delayed(bam_to_windows)(sample) for sample in samplenames_with_fullpath)
+	# Running in parallel leads to 0 annotated counts, probably due to global midpos not being assigned correctly
+	# Changing to run this individually per sample, hence it will take longer to run
+	index_counter = 0
+	# Putting a simple counter to get an idea on how many samples have been processed
+	for sample in samplenames_with_fullpath:
+		index_counter += 1
+                print(index_counter)
+                bam_to_windows(sample)
