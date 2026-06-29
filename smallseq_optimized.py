@@ -29,6 +29,8 @@ from collections import defaultdict
 from multiprocessing import Pool
 from functools import partial
 import time
+import json
+import bisect
 
 # Try to import optional dependencies
 try:
@@ -48,11 +50,65 @@ logger = logging.getLogger(__name__)
 
 class SmallSeqPipeline:
     """Main pipeline class for SmallSeq data processing"""
-    
+
+    STEP_NAMES = [
+        "UMI Removal",
+        "Adapter Trimming",
+        "STAR Alignment",
+        "Soft-clip Removal",
+        "Read Length Filtering",
+        "UMI Deduplication",
+        "Precursor Removal",
+        "Count Generation",
+        "Count Merging",
+        "miRNA Collapsing",
+    ]
+
     def __init__(self, config):
         self.config = config
         self.samples = []
+        self.checkpoint_file = os.path.join(config['output_dir'], '.pipeline_checkpoint.json')
+        self.completed_steps = set()
         self.validate_config()
+        self.load_checkpoint()
+    
+    def load_checkpoint(self):
+        """Load completed steps from checkpoint file"""
+        if os.path.exists(self.checkpoint_file):
+            try:
+                with open(self.checkpoint_file, 'r') as f:
+                    data = json.load(f)
+                    self.completed_steps = set(data.get('completed_steps', []))
+                    logger.info(f"Loaded checkpoint with {len(self.completed_steps)} completed steps")
+            except Exception as e:
+                logger.warning(f"Could not load checkpoint: {e}")
+                self.completed_steps = set()
+    
+    def save_checkpoint(self):
+        """Save completed steps to checkpoint file"""
+        try:
+            self.safe_mkdir(self.config['output_dir'])
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump({'completed_steps': sorted(list(self.completed_steps))}, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save checkpoint: {e}")
+    
+    def mark_step_complete(self, step_name):
+        """Mark a step as completed"""
+        self.completed_steps.add(step_name)
+        self.save_checkpoint()
+        logger.info(f"Marked step '{step_name}' as complete")
+    
+    def is_step_complete(self, step_name):
+        """Check if a step has been completed"""
+        return step_name in self.completed_steps
+    
+    def reset_checkpoint(self):
+        """Reset all completed steps"""
+        self.completed_steps = set()
+        if os.path.exists(self.checkpoint_file):
+            os.remove(self.checkpoint_file)
+        logger.info("Checkpoint reset")
         
     def validate_config(self):
         """Validate configuration parameters"""
@@ -67,12 +123,19 @@ class SmallSeqPipeline:
         # Set defaults
         self.config.setdefault('threads', 4)
         self.config.setdefault('umi_pattern', 'NNNNNNNN')
+        
+        # Configure read length filtering thresholds
+        # 18bp: Minimum from cutadapt adapter trimming (step 2) - NCBI small RNA definition
+        # 40bp: Maximum filter (step 6) - Defines upper bound for small RNA molecules
+        # 35bp: Precursor threshold (step 8) - Reads ≤35bp always retained (too short to be precursor-derived)
+        # 41bp: Reference length minRlen (step 8) - Used for calculating genomic context offset in precursor detection
         self.config.setdefault('max_read_len', 40)
         self.config.setdefault('min_read_len', 41)
         self.config.setdefault('adapter_file', '../adapters/cutadapt_3prime.fa')
         self.config.setdefault('allowed_5p_clip', 0)
         self.config.setdefault('allowed_3p_clip', 3)
         self.config.setdefault('dedup_method', 'adjacency')
+        self.config.setdefault('legacy_count', False)
         
     def safe_mkdir(self, path):
         """Create directory if it doesn't exist"""
@@ -94,26 +157,33 @@ class SmallSeqPipeline:
         logger.info(f"Found {len(self.samples)} samples to process")
         
         # Pipeline steps
-        steps = [
-            ("UMI Removal", self.step1_remove_umi),
-            ("Adapter Trimming", self.step2_trim_adapters),
-            ("STAR Alignment", self.step3_star_alignment),
-#            ("SAM Processing", self.step4_process_sam),
-            ("Soft-clip Removal", self.step5_remove_softclipped),
-            ("Read Length Filtering", self.step6_filter_by_length),
-            ("UMI Deduplication", self.step7_umi_dedup),
-            ("Precursor Removal", self.step8_remove_precursors),
-            ("Count Generation", self.step9_count_smallrnas),
-            ("Count Merging", self.step10_merge_counts),
-            ("miRNA Collapsing", self.step11_collapse_mirnas)
+        step_funcs = [
+            self.step1_remove_umi,
+            self.step2_trim_adapters,
+            self.step3_star_alignment,
+            self.step5_remove_softclipped,
+            self.step6_filter_by_length,
+            self.step7_umi_dedup,
+            self.step8_remove_precursors,
+            self.step9_count_smallrnas,
+            self.step10_merge_counts,
+            self.step11_collapse_mirnas,
         ]
+        steps = list(zip(self.STEP_NAMES, step_funcs))
         
         for step_name, step_func in steps:
+            if self.is_step_complete(step_name):
+                logger.info(f"{'='*60}")
+                logger.info(f"Step: {step_name} [SKIPPED - Already completed]")
+                logger.info(f"{'='*60}")
+                continue
+            
             logger.info(f"\n{'='*60}")
             logger.info(f"Step: {step_name}")
             logger.info(f"{'='*60}")
             try:
                 step_func()
+                self.mark_step_complete(step_name)
             except Exception as e:
                 logger.error(f"Error in {step_name}: {str(e)}")
                 raise
@@ -204,14 +274,14 @@ class SmallSeqPipeline:
         input_dir = os.path.join(self.config['output_dir'], 'step2_adapter_trimmed')
         self.safe_mkdir(output_dir)
         
-        fq_list = os.path.join(output_dir, "star_fastqs.txt")
-        rg_list = os.path.join(output_dir, "star_readgroups.txt")
+        fq_list = os.path.abspath(os.path.join(output_dir, "star_fastqs.txt"))
+        rg_list = os.path.abspath(os.path.join(output_dir, "star_readgroups.txt"))
         samples_used = []
         
         # 1) Collect FASTQs + read groups
         with open(fq_list, "w") as fq_fh, open(rg_list, "w") as rg_fh:
             for sample in self.samples:
-                fq = os.path.join(input_dir, sample, f"{sample}.fastq.gz")
+                fq = os.path.abspath(os.path.join(input_dir, sample, f"{sample}.fastq.gz"))
                 if not os.path.exists(fq):
                     logger.warning(f"Input file not found: {fq}")
                     continue
@@ -223,16 +293,17 @@ class SmallSeqPipeline:
             raise RuntimeError("No valid FASTQs found for STAR alignment")
         
         # 2) Run STAR
-        prefix = os.path.join(output_dir, "all_samples_")
+        genome_dir = os.path.abspath(self.config['genome_dir'])
+        prefix = os.path.abspath(os.path.join(output_dir, "all_samples_"))
         star_cmd = (
             f"STAR "
             f"--runThreadN {self.config['threads']} "
-            f"--genomeDir {self.config['genome_dir']} "
+            f"--genomeDir {genome_dir} "
             f"--readFilesManifest {fq_list} "
             f"--readFilesCommand zcat "
-            f"--outSAMtype BAM SortedByCoordinate "
+            f"--outSAMtype BAM Unsorted "
             f"--outSAMstrandField intronMotif "
-            f"--outFilterMultimapNmax 50 "
+            f"--outFilterMultimapNmax 20 "
             f"--outFilterScoreMinOverLread 0 "
             f"--outFilterMatchNmin 18 "
             f"--outFilterMatchNminOverLread 0 "
@@ -241,7 +312,7 @@ class SmallSeqPipeline:
             f"--outFileNamePrefix {prefix} "
             f"--outSAMattributes NH HI AS nM RG"
         )
-        
+        logger.info(f"Running STAR aligmnet : {star_cmd}")
         result = subprocess.run(
             star_cmd,
             shell=True,
@@ -254,22 +325,31 @@ class SmallSeqPipeline:
         
         # 3) Split BAM by read group
         combined_bam = os.path.join(
-            output_dir, "all_samples_Aligned.sortedByCoord.out.bam"
+            os.path.join(self.config['output_dir'], 'step3_star_aligned'), "all_samples_Aligned.sortedByCoord.out.bam"
         )
-        if not os.path.exists(combined_bam):
+        input_combined_bam = os.path.join(
+            os.path.join(self.config['output_dir'], 'step3_star_aligned'), "all_samples_Aligned.out.bam"
+        )
+        if not os.path.exists(input_combined_bam):
             raise FileNotFoundError("Combined STAR BAM not found")
-        
-        split_cmd = f"samtools split -@ {self.config['threads']} -M -1 -d RG {combined_bam}"
+        logger.info(f"samtools split input BAM : {combined_bam}")
+        logger.info(f"Python process CWD       : {os.getcwd()}")
+        split_cmd = f"samtools sort -@ {self.config['threads']} {os.path.abspath(input_combined_bam)} -o {os.path.abspath(combined_bam)};samtools split -@ {self.config['threads']} -M -1 -d RG -f {os.path.abspath(output_dir)}/%*_%!.%. {os.path.abspath(combined_bam)}"
+        logger.info(f"Running samtools split command: {split_cmd}")
         result = subprocess.run(
             split_cmd,
             shell=True,
-            cwd=output_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
         )
         if result.returncode != 0:
             raise RuntimeError(f"samtools split failed:\n{result.stderr}")
+        
+        # Remove the combined BAM to free disk space
+        os.remove(combined_bam)
+        os.remove(input_combined_bam)
+        logger.info(f"Removed combined BAMs: {combined_bam}\n{input_combined_bam}")
         
         # 4) Move, rename, and index per sample
         for sample in samples_used:
@@ -421,10 +501,14 @@ class SmallSeqPipeline:
         self.safe_mkdir(sample_out)
         
         inbam = os.path.join(input_dir, sample, f"{sample}.bam")
-        outbam = os.path.join(sample_out, f"{sample}.bam")
+        outbam = os.path.join(sample_out, f"{sample}_dedup.bam")
         logfile = os.path.join(sample_out, "dedup.log")
         
+        # NOTE: --read-length flag is CRITICAL for small RNA-seq. It ensures reads of different
+        # lengths at the same position with the same UMI are kept as separate molecules.
+        # Without it, miR-21 (22bp) and miR-21-5p (23bp) would be incorrectly merged.
         cmd = f"umi_tools dedup --method {self.config['dedup_method']} " \
+              f"--read-length " \
               f"--output-stats {sample_out}/stats " \
               f"-I {inbam} -S {outbam} -L {logfile}"
         
@@ -449,7 +533,7 @@ class SmallSeqPipeline:
         sample_out = os.path.join(output_dir, sample)
         self.safe_mkdir(sample_out)
         
-        inbam = os.path.join(input_dir, sample, f"{sample}.bam")
+        inbam = os.path.join(input_dir, sample, f"{sample}_dedup.bam")
         outbam_tmp = os.path.join(sample_out, f"{sample}_tmp.bam")
         outbam = os.path.join(sample_out, f"{sample}.bam")
         
@@ -457,7 +541,7 @@ class SmallSeqPipeline:
         outbam_obj = pysam.AlignmentFile(outbam_tmp, "wb", template=inbam_obj)
         
         for read in inbam_obj:
-            readlen = len(read.seq)
+            readlen = len(read.query_sequence)
             
             if readlen <= 35:  # Keep short reads
                 outbam_obj.write(read)
@@ -470,7 +554,9 @@ class SmallSeqPipeline:
             minRlen = self.config['min_read_len']
             upperlimit = minRlen - readlen
             
-            keep_read = True
+            # Default to dropping the read — matches original behavior where
+            # non-canonical flags (anything except forward 0 or reverse 16) are silently discarded
+            keep_read = False
             if read.flag == 0:  # Forward strand
                 bpwindow = gf.get_seq_from_to(readchr, readend+1, readend+upperlimit)
                 patterns = {
@@ -482,6 +568,8 @@ class SmallSeqPipeline:
                 }
                 if readlen in patterns and bpwindow in patterns[readlen]:
                     keep_read = False
+                else:
+                    keep_read = True
                     
             elif read.flag == 16:  # Reverse strand
                 bpwindow = gf.get_seq_from_to(readchr, readstart-upperlimit, readstart-1)
@@ -494,6 +582,8 @@ class SmallSeqPipeline:
                 }
                 if readlen in patterns and bpwindow in patterns[readlen]:
                     keep_read = False
+                else:
+                    keep_read = True
             
             if keep_read:
                 outbam_obj.write(read)
@@ -506,58 +596,71 @@ class SmallSeqPipeline:
         pysam.index(outbam)
         os.remove(outbam_tmp)
     
+    def _process_precursor_sample_parallel(self, sample):
+        """Worker-safe wrapper: creates its own GenomeFetch instance per process"""
+        sys.path.insert(0, os.path.dirname(__file__))
+        from GenomeFetch import GenomeFetch
+        gf = GenomeFetch(genomedir=self.config['genome_fasta'])
+        self._process_precursor_sample(sample, gf)
+
     def step8_remove_precursors(self):
         """Remove reads from precursor RNAs based on genomic context"""
         output_dir = os.path.join(self.config['output_dir'], 'step8_precursor_removed')
         self.safe_mkdir(output_dir)
         
-        # Import GenomeFetch
-        sys.path.insert(0, os.path.dirname(__file__))
-        try:
-            from GenomeFetch import GenomeFetch
-        except ImportError:
-            logger.error("GenomeFetch.py not found. Please ensure it's in the same directory.")
-            raise
-        
-        gf = GenomeFetch(genomedir=self.config['genome_fasta'])
-        
-        # Process samples sequentially due to GenomeFetch not being thread-safe
-        for sample in self.samples:
-            self._process_precursor_sample(sample, gf)
+        with Pool(self.config['threads']) as pool:
+            pool.map(self._process_precursor_sample_parallel, self.samples)
     
     # ===== Step 9: Count Small RNAs =====
-    def _process_count_sample(self, sample, intervals, coord2geneid, geneid2name, geneidlist):
-        """Process a single sample for counting"""
+    def _process_count_sample(self, sample, interval_lists, interval_starts, max_interval_len,
+                              coord2geneid, geneid2name, geneidlist, legacy_count):
+        """Process a single sample for counting using gene annotations
+
+        This function is designed to be called safely in parallel via multiprocessing.Pool.
+        It uses a locally-scoped midpos variable, making it thread-safe (unlike the original
+        count_smallrnas.py which had a global midpos variable bug that forced serial execution).
+        """
         input_dir = os.path.join(self.config['output_dir'], 'step8_precursor_removed')
         output_dir = os.path.join(self.config['output_dir'], 'step9_counts')
-        
+
         sample_out = os.path.join(output_dir, sample)
         self.safe_mkdir(sample_out)
-        
+
         inbam = os.path.join(input_dir, sample, f"{sample}.bam")
         outfile = os.path.join(sample_out, f"{sample}_Count.txt")
-        
-        def find_overlaps(chrom, pos, strand):
-            """Find genes overlapping a position"""
+
+        def find_overlaps(chrom, qstart, qend, strand):
+            """Find gene intervals overlapping [qstart, qend] using bisect O(log n) lookup.
+            For legacy midpoint mode, pass qstart == qend == midpos."""
+            key = (chrom, strand)
+            if key not in interval_lists:
+                return []
+            ivs = interval_lists[key]
+            starts = interval_starts[key]
+            i = bisect.bisect_right(starts, qend) - 1
             overlaps = []
-            if chrom in intervals and strand in intervals[chrom]:
-                for start, end, geneid in intervals[chrom][strand]:
-                    if start <= pos <= end:
-                        overlaps.append(f"{chrom}:{start+1}-{end}:{strand}")
+            while i >= 0 and starts[i] >= qstart - max_interval_len:
+                start, end, geneid = ivs[i]
+                if end >= qstart:
+                    overlaps.append(f"{chrom}:{start+1}-{end}:{strand}")
+                i -= 1
             return overlaps
-        
+
         inbam_obj = pysam.AlignmentFile(inbam, "rb")
-        
+
         read2overlaps = defaultdict(list)
-        
+
         for read in inbam_obj:
             readchr = inbam_obj.get_reference_name(read.reference_id)
             readstart = read.pos
             readend = read.reference_end
             strand = "-" if read.is_reverse else "+"
-            
-            midpos = (readstart + readend) // 2
-            overlaps = find_overlaps(readchr, midpos, strand)
+
+            if legacy_count:
+                midpos = (readstart + readend) // 2
+                overlaps = find_overlaps(readchr, midpos, midpos, strand)
+            else:
+                overlaps = find_overlaps(readchr, readstart, readend, strand)
             read2overlaps[read.qname].append(overlaps)
         
         inbam_obj.close()
@@ -573,11 +676,19 @@ class SmallSeqPipeline:
             if annot_count > 0:
                 for overlaps in overlap_list:
                     if overlaps:
-                        for coord in overlaps:
-                            geneid = coord2geneid.get(coord, 'NA')
-                            if geneid not in geneid2counts:
-                                geneid2counts[geneid] = 0
-                            geneid2counts[geneid] += 1 / annot_count
+                        # Take only the first overlapping coordinate,
+                        # matching original count_smallrnas.py coord[0] behavior
+                        coord = overlaps[0]
+                        geneid = coord2geneid.get(coord, 'NA')
+                        if geneid not in geneid2counts:
+                            geneid2counts[geneid] = 0
+                        geneid2counts[geneid] += 1 / annot_count
+                    else:
+                        # Unannotated alignment of a partially-annotated read
+                        # still contributes 1/annot_count to "NA", matching original
+                        if 'NA' not in geneid2counts:
+                            geneid2counts['NA'] = 0
+                        geneid2counts['NA'] += 1 / annot_count
             else:
                 num_unannot += 1
         
@@ -592,7 +703,15 @@ class SmallSeqPipeline:
                 fh.write(f"{geneid2name[geneid]}\t{geneid}\t{geneid2counts.get(geneid, 0)}\n")
     
     def step9_count_smallrnas(self):
-        """Count small RNAs using annotation"""
+        """Count small RNAs using gene annotation file
+        
+        PARALLELIZATION NOTE: The original pipeline's count_smallrnas.py had parallelization 
+        disabled due to a global 'midpos' variable bug that corrupted results in parallel 
+        (see src/count_smallrnas.py line 139 comment). This version fixes that bug by using 
+        locally-scoped variables in _process_count_sample(), enabling safe parallel execution 
+        via multiprocessing.Pool. This provides significant performance improvement over the 
+        original serial implementation.
+        """
         output_dir = os.path.join(self.config['output_dir'], 'step9_counts')
         self.safe_mkdir(output_dir)
         
@@ -600,23 +719,41 @@ class SmallSeqPipeline:
         geneid2name = {}
         coord2geneid = {}
         geneidlist = []
-        
-        # Simple interval tree implementation
-        intervals = defaultdict(lambda: defaultdict(list))
-        
+
+        # interval_lists: (chrom, strand) -> sorted list of (start, end, geneid)
+        # interval_starts: (chrom, strand) -> sorted list of starts (parallel, for bisect)
+        interval_lists = {}
+        max_interval_len = 0
+
         for line in open(self.config['annotation'], 'r'):
             p = line.split()
             chrom, start, end, strand, geneid, genename = p[2], int(p[4]), int(p[5]), p[3], p[1], p[12]
-            
-            intervals[chrom][strand].append((start, end, geneid))
+            key = (chrom, strand)
+            if key not in interval_lists:
+                interval_lists[key] = []
+            interval_lists[key].append((start, end, geneid))
+            max_interval_len = max(max_interval_len, end - start)
             coord = f"{chrom}:{start+1}-{end}:{strand}"
             coord2geneid[coord] = geneid
             geneid2name[geneid] = genename
             geneidlist.append(geneid)
-        
-        # Process samples sequentially to avoid shared state issues
-        for sample in self.samples:
-            self._process_count_sample(sample, intervals, coord2geneid, geneid2name, geneidlist)
+
+        # Sort by start and build parallel start lists for bisect
+        interval_starts = {}
+        for key in interval_lists:
+            interval_lists[key].sort()
+            interval_starts[key] = [iv[0] for iv in interval_lists[key]]
+
+        count_func = partial(self._process_count_sample,
+                             interval_lists=interval_lists,
+                             interval_starts=interval_starts,
+                             max_interval_len=max_interval_len,
+                             coord2geneid=coord2geneid,
+                             geneid2name=geneid2name,
+                             geneidlist=geneidlist,
+                             legacy_count=self.config['legacy_count'])
+        with Pool(self.config['threads']) as pool:
+            pool.map(count_func, self.samples)
     
     # ===== Step 10: Merge Counts =====
     def step10_merge_counts(self):
@@ -719,6 +856,10 @@ def main():
     parser.add_argument('--max_read_len', type=int, default=40, help='Max read length for small RNA')
     parser.add_argument('--min_read_len', type=int, default=41, help='Min read length for precursor')
     parser.add_argument('--genome_fasta', help='Reference genome split fasta file directory')
+    parser.add_argument('--legacy-count', action='store_true',
+                        help='Use midpoint-based read assignment instead of whole-read overlap')
+    parser.add_argument('--reset', action='store_true', help='Reset checkpoint and start from the beginning')
+    parser.add_argument('--start-from', help='Start from a specific step (e.g., "STAR Alignment")')
     
     args = parser.parse_args()
     
@@ -739,12 +880,30 @@ def main():
             'umi_pattern': args.umi_pattern,
             'max_read_len': args.max_read_len,
             'min_read_len': args.min_read_len,
+            'legacy_count': args.legacy_count,
         }
         if args.adapter_file:
             config['adapter_file'] = args.adapter_file
     
     # Run pipeline
     pipeline = SmallSeqPipeline(config)
+    
+    # Handle reset flag
+    if args.reset:
+        logger.info("Resetting checkpoint as requested")
+        pipeline.reset_checkpoint()
+    
+    # Handle start-from flag
+    if args.start_from:
+        if args.start_from not in SmallSeqPipeline.STEP_NAMES:
+            raise ValueError(
+                f"Unknown step '{args.start_from}'. Valid steps: {SmallSeqPipeline.STEP_NAMES}"
+            )
+        idx = SmallSeqPipeline.STEP_NAMES.index(args.start_from)
+        pipeline.completed_steps = set(SmallSeqPipeline.STEP_NAMES[:idx])
+        pipeline.save_checkpoint()
+        logger.info(f"Starting from step: {args.start_from}")
+    
     pipeline.run()
 
 
