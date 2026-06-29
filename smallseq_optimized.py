@@ -323,19 +323,34 @@ class SmallSeqPipeline:
         if result.returncode != 0:
             raise RuntimeError(f"STAR failed:\n{result.stderr}")
         
-        # 3) Split BAM by read group
-        combined_bam = os.path.join(
-            os.path.join(self.config['output_dir'], 'step3_star_aligned'), "all_samples_Aligned.sortedByCoord.out.bam"
-        )
-        input_combined_bam = os.path.join(
-            os.path.join(self.config['output_dir'], 'step3_star_aligned'), "all_samples_Aligned.out.bam"
-        )
+        # 3a) Sort the unsorted STAR output, then remove it immediately to free space
+        input_combined_bam = os.path.abspath(os.path.join(output_dir, "all_samples_Aligned.out.bam"))
+        combined_bam = os.path.abspath(os.path.join(output_dir, "all_samples_Aligned.sortedByCoord.out.bam"))
+
         if not os.path.exists(input_combined_bam):
             raise FileNotFoundError("Combined STAR BAM not found")
-        logger.info(f"samtools split input BAM : {combined_bam}")
-        logger.info(f"Python process CWD       : {os.getcwd()}")
-        split_cmd = f"samtools sort -@ {self.config['threads']} {os.path.abspath(input_combined_bam)} -o {os.path.abspath(combined_bam)};samtools split -@ {self.config['threads']} -M -1 -d RG -f {os.path.abspath(output_dir)}/%*_%!.%. {os.path.abspath(combined_bam)}"
-        logger.info(f"Running samtools split command: {split_cmd}")
+
+        sort_cmd = f"samtools sort -@ {self.config['threads']} {input_combined_bam} -o {combined_bam}"
+        logger.info(f"Sorting combined BAM: {sort_cmd}")
+        result = subprocess.run(
+            sort_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"samtools sort failed:\n{result.stderr}")
+
+        os.remove(input_combined_bam)
+        logger.info(f"Removed unsorted BAM: {input_combined_bam}")
+
+        # 3b) Split sorted BAM by read group, then remove it to free space
+        split_cmd = (
+            f"samtools split -@ {self.config['threads']} -M -1 -d RG "
+            f"-f {os.path.abspath(output_dir)}/%*_%!.%. {combined_bam}"
+        )
+        logger.info(f"Splitting sorted BAM: {split_cmd}")
         result = subprocess.run(
             split_cmd,
             shell=True,
@@ -345,11 +360,9 @@ class SmallSeqPipeline:
         )
         if result.returncode != 0:
             raise RuntimeError(f"samtools split failed:\n{result.stderr}")
-        
-        # Remove the combined BAM to free disk space
+
         os.remove(combined_bam)
-        os.remove(input_combined_bam)
-        logger.info(f"Removed combined BAMs: {combined_bam}\n{input_combined_bam}")
+        logger.info(f"Removed sorted combined BAM: {combined_bam}")
         
         # 4) Move, rename, and index per sample
         for sample in samples_used:
