@@ -27,6 +27,15 @@ From: ubuntu:22.04
     # Install required Python packages
     pip3 install --no-cache-dir pysam pyyaml umi_tools
     
+    # Install Calib
+    wget https://github.com/vpc-ccg/calib/archive/refs/tags/v0.3.7.tar.gz
+    tar -xf v0.3.7.tar.gz
+    cd calib-0.3.7
+    make 
+    cd ..
+    mv calib-0.3.7 /opt/calib
+    rm -rf v0.3.7.tar.gz
+
     # Download STAR
     mkdir -p /opt/smallseq/annotations
     wget https://github.com/alexdobin/STAR/archive/2.7.11b.tar.gz
@@ -42,5 +51,5 @@ From: ubuntu:22.04
     
 
 %environment
-    export PATH=/opt/smallseq:/opt/smallseq/STAR-2.7.11b/bin/Linux_x86_64:$PATH
+    export PATH=/opt/smallseq:/opt/smallseq/STAR-2.7.11b/bin/Linux_x86_64:/opt/calib/:$PATH
     export PYTHONUNBUFFERED=1
