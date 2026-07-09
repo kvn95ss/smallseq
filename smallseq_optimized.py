@@ -62,6 +62,7 @@ class SmallSeqPipeline:
         "Count Generation",
         "Count Merging",
         "miRNA Collapsing",
+        "Reporting",
     ]
 
     def __init__(self, config):
@@ -168,6 +169,7 @@ class SmallSeqPipeline:
             self.step9_count_smallrnas,
             self.step10_merge_counts,
             self.step11_collapse_mirnas,
+            self.step12_reporting,
         ]
         steps = list(zip(self.STEP_NAMES, step_funcs))
         
@@ -245,17 +247,20 @@ class SmallSeqPipeline:
         
         input_fq = os.path.join(input_dir, sample, f"{sample}_umiTrim.fq.gz")
         output_fq = os.path.join(sample_out, f"{sample}.fastq.gz")
-        
+        logfile = os.path.join(sample_out, "cutadapt.log")
+
         if not os.path.exists(input_fq):
             logger.warning(f"Input file not found: {input_fq}")
             return
-        
+
         cmd = f"cutadapt -a file:{self.config['adapter_file']} " \
-              f"-e 0.1 -O 1 -u 2 --quiet --minimum-length 18 " \
+              f"-e 0.1 -O 1 -u 2 --minimum-length 18 " \
               f"-o {output_fq} {input_fq}"
-        
+
         #subprocess.run(cmd, shell=True, check=True)
         result = subprocess.run(cmd,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True)
+        with open(logfile, 'w') as fh:
+            fh.write(result.stdout)
         if result.returncode != 0:
             logger.warning(f"Adapter trimming warning for {sample}: {result.stderr}")
     
@@ -462,8 +467,14 @@ class SmallSeqPipeline:
         pysam.sort('-o', outbam, outbam_tmp)
         pysam.index(outbam)
         os.remove(outbam_tmp)
-        
+
         logger.info(f"{sample}: Removed {100*(1-kept/total):.2f}% clipped reads")
+
+        stats_file = os.path.join(sample_out, f"{sample}_softclip_stats.txt")
+        with open(stats_file, 'w') as fh:
+            fh.write(f"total_reads\t{total}\n")
+            fh.write(f"kept_reads\t{kept}\n")
+            fh.write(f"removed_pct\t{100*(1-kept/total):.2f}\n")
     
     def step5_remove_softclipped(self):
         """Remove soft-clipped reads"""
@@ -493,8 +504,16 @@ class SmallSeqPipeline:
         result = subprocess.run(cmd,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True)
         if result.returncode !=0:
             logger.warning(f"Filtering warning for {sample}: {result.stderr}")
-        
+
         pysam.index(outbam)
+
+        input_flagstat = os.path.join(sample_out, f"{sample}_input_flagstat.txt")
+        output_flagstat = os.path.join(sample_out, f"{sample}_output_flagstat.txt")
+        for bam, flagstat_file in ((inbam, input_flagstat), (outbam, output_flagstat)):
+            result = subprocess.run(f"samtools flagstat {bam} > {flagstat_file}",
+                                    shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True)
+            if result.returncode != 0:
+                logger.warning(f"flagstat warning for {sample}: {result.stderr}")
     
     def step6_filter_by_length(self):
         """Filter reads by length"""
@@ -552,12 +571,15 @@ class SmallSeqPipeline:
         
         inbam_obj = pysam.AlignmentFile(inbam, "rb")
         outbam_obj = pysam.AlignmentFile(outbam_tmp, "wb", template=inbam_obj)
-        
+
+        total, kept = 0, 0
         for read in inbam_obj:
+            total += 1
             readlen = len(read.query_sequence)
-            
+
             if readlen <= 35:  # Keep short reads
                 outbam_obj.write(read)
+                kept += 1
                 continue
             
             readchr = inbam_obj.get_reference_name(read.reference_id)
@@ -600,15 +622,22 @@ class SmallSeqPipeline:
             
             if keep_read:
                 outbam_obj.write(read)
-        
+                kept += 1
+
         outbam_obj.close()
         inbam_obj.close()
-        
+
         # Sort and index
         pysam.sort('-o', outbam, outbam_tmp)
         pysam.index(outbam)
         os.remove(outbam_tmp)
-    
+
+        stats_file = os.path.join(sample_out, f"{sample}_precursor_stats.txt")
+        with open(stats_file, 'w') as fh:
+            fh.write(f"total_reads\t{total}\n")
+            fh.write(f"kept_reads\t{kept}\n")
+            fh.write(f"removed_pct\t{100*(1-kept/total):.2f}\n")
+
     def _process_precursor_sample_parallel(self, sample):
         """Worker-safe wrapper: creates its own GenomeFetch instance per process"""
         sys.path.insert(0, os.path.dirname(__file__))
@@ -846,9 +875,107 @@ class SmallSeqPipeline:
                 outfh.write(f"{gene}\t{gene2trid[gene]}\t{counts_str}\n")
         
         logger.info(f"Final counts written to {output_file}")
-        
+
         # Clean up intermediate file
         os.remove(input_file)
+
+    # ===== Step 12: Reporting =====
+    def _write_molecule_counts_custom_content(self, custom_dir):
+        """Parse counts_molc_final.txt header lines into a MultiQC custom-content bargraph"""
+        counts_file = os.path.join(self.config['output_dir'], 'counts_molc_final.txt')
+        samples, unannot, annot = [], [], []
+        with open(counts_file, 'r') as fh:
+            for line in fh:
+                if line.startswith('#samples'):
+                    samples = line.strip().split('\t')[1:]
+                elif line.startswith('#unannotatedmolc'):
+                    unannot = line.strip().split('\t')[1:]
+                elif line.startswith('#annotatedmolc'):
+                    annot = line.strip().split('\t')[1:]
+                    break
+
+        molc_counts = {}
+        outfile = os.path.join(custom_dir, 'smallrna_molecule_counts_mqc.tsv')
+        with open(outfile, 'w') as fh:
+            fh.write("# id: 'smallrna_molecule_counts'\n")
+            fh.write("# section_name: 'SmallSeq Molecule Counts'\n")
+            fh.write("# description: 'Annotated vs. unannotated small RNA molecule counts per sample after precursor removal and counting.'\n")
+            fh.write("# plot_type: 'bargraph'\n")
+            fh.write("# pconfig:\n")
+            fh.write("#     id: 'smallrna_molecule_counts_plot'\n")
+            fh.write("#     title: 'SmallSeq: Annotated vs Unannotated Molecule Counts'\n")
+            fh.write("#     ylab: 'Molecule count'\n")
+            fh.write("Sample\tannotated_molecules\tunannotated_molecules\n")
+            for sample, a, u in zip(samples, annot, unannot):
+                fh.write(f"{sample}\t{a}\t{u}\n")
+                molc_counts[sample] = (a, u)
+
+        return molc_counts
+
+    def _write_filtering_stats_custom_content(self, custom_dir):
+        """Aggregate the step5/step8 per-sample stats files into a MultiQC custom-content bargraph"""
+        def read_stats(stats_file):
+            stats = {}
+            with open(stats_file, 'r') as fh:
+                for line in fh:
+                    key, value = line.strip().split('\t')
+                    stats[key] = value
+            return stats
+
+        filtering_stats = {}
+        outfile = os.path.join(custom_dir, 'smallrna_filtering_stats_mqc.tsv')
+        with open(outfile, 'w') as fh:
+            fh.write("# id: 'smallrna_filtering_stats'\n")
+            fh.write("# section_name: 'SmallSeq Filtering Stats'\n")
+            fh.write("# description: 'Reads kept/removed by soft-clip removal (step 5) and precursor removal (step 8).'\n")
+            fh.write("# plot_type: 'bargraph'\n")
+            fh.write("# pconfig:\n")
+            fh.write("#     id: 'smallrna_filtering_stats_plot'\n")
+            fh.write("#     title: 'SmallSeq: Filtering Steps Read Counts'\n")
+            fh.write("#     ylab: '# Reads'\n")
+            fh.write("Sample\tstep5_kept\tstep5_removed\tstep8_kept\tstep8_removed\n")
+            for sample in self.samples:
+                softclip_file = os.path.join(self.config['output_dir'], 'step5_clipped_removed', sample, f"{sample}_softclip_stats.txt")
+                precursor_file = os.path.join(self.config['output_dir'], 'step8_precursor_removed', sample, f"{sample}_precursor_stats.txt")
+                if not os.path.exists(softclip_file) or not os.path.exists(precursor_file):
+                    logger.warning(f"Missing filtering stats for {sample}, skipping in report")
+                    continue
+
+                softclip = read_stats(softclip_file)
+                precursor = read_stats(precursor_file)
+                step5_kept = int(softclip['kept_reads'])
+                step5_removed = int(softclip['total_reads']) - step5_kept
+                step8_kept = int(precursor['kept_reads'])
+                step8_removed = int(precursor['total_reads']) - step8_kept
+                fh.write(f"{sample}\t{step5_kept}\t{step5_removed}\t{step8_kept}\t{step8_removed}\n")
+                filtering_stats[sample] = (step5_kept, step5_removed, step8_kept, step8_removed)
+
+        return filtering_stats
+
+    def step12_reporting(self):
+        """Aggregate pipeline-specific stats into MultiQC custom content and generate the MultiQC report"""
+        output_dir = self.config['output_dir']
+        custom_dir = os.path.join(output_dir, 'multiqc_custom')
+        self.safe_mkdir(custom_dir)
+
+        molc_counts = self._write_molecule_counts_custom_content(custom_dir)
+        filtering_stats = self._write_filtering_stats_custom_content(custom_dir)
+
+        cmd = f"multiqc {output_dir} -o {output_dir} -n multiqc_report"
+        result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if result.returncode != 0:
+            logger.warning(f"MultiQC report generation warning: {result.stderr}")
+
+        logger.info("Pipeline summary:")
+        for sample in self.samples:
+            if sample in molc_counts:
+                annot, unannot = molc_counts[sample]
+                logger.info(f"  {sample}: {annot} annotated / {unannot} unannotated molecules")
+            if sample in filtering_stats:
+                step5_kept, step5_removed, step8_kept, step8_removed = filtering_stats[sample]
+                logger.info(f"  {sample}: soft-clip removal kept {step5_kept} (removed {step5_removed}), "
+                            f"precursor removal kept {step8_kept} (removed {step8_removed})")
+        logger.info(f"MultiQC report: {os.path.join(output_dir, 'multiqc_report.html')}")
 
 
 def main():

@@ -22,7 +22,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install required Python packages
-RUN pip3 install --no-cache-dir pysam pyyaml umi_tools
+RUN pip3 install --no-cache-dir pysam pyyaml umi_tools multiqc
 
 # Install Calib
 RUN wget https://github.com/vpc-ccg/calib/archive/refs/tags/v0.3.7.tar.gz && \

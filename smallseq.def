@@ -25,7 +25,7 @@ From: ubuntu:22.04
     rm -rf /var/lib/apt/lists/*
 
     # Install required Python packages
-    pip3 install --no-cache-dir pysam pyyaml umi_tools
+    pip3 install --no-cache-dir pysam pyyaml umi_tools multiqc
     
     # Install Calib
     wget https://github.com/vpc-ccg/calib/archive/refs/tags/v0.3.7.tar.gz
