@@ -1,9 +1,31 @@
 # SmallSeq data analysis pipeline
-This is the updated repository which has unified all the multiple scripts from the src directory of the original Smallseq repository. The scripts have also been ported to python3.
+This is the updated SmallSeq repository which has several updates and quality of life changes, such as -
+ - Moved from python2 to python3
+ - Unified all the various python scripts as functions, merging them into a single python file
+ - Included build_annotations.py, so custom annotations can now be built.
+ - Quality of life changes - 
+    - Single script, easy to execute
+    - Simple step-based checkpoint system - ability to auto-resume or start pipeline from certain step
+    - Optimized for small fastq files - reduces alignment time 
+
+This pipeline was tested on Asus ROG Zephyrus G14 laptop, with Ryzen 7735HS and 48 GB RAM. 
+
+## Recommended hardware requirements 
+If running on a HPC, this would not be much of an issue
+
+ - Storage - need to have at least 2-4x the size of combined fastq.gz files, for ex. if total fastq.gz files are 4 GB, it is advisible to have at least 16GB of free storage.
+ - CPU - Recommended at least 4 cores 
+ - RAM - minimum 32 GB
 
 ### Prerequisites - to be expanded
- - Install cutadapt, UMI-tools
+Easiest way to run the pipeline is by using either Docker or Singularity. Images to build them under both tools have been provided. 
+
+To run the pipeline natively, you would need the following software environment.
+
+ - Install cutadapt, UMI-tools, samtools > 1.23, or version which supports split command
  - Python packages - argparse, and others - *definitive list to be updated*
+
+Annotation files / references
  - Generate STAR reference using genome of choice - *Instructions will be updated soon*
  - Split the same genome based on chromosomal contig - *Instructions will be updated soon*
 
