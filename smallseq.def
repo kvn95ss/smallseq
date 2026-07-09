@@ -3,7 +3,7 @@ Bootstrap: docker
 From: ubuntu:22.04
 
 %labels
-    Author "Antigravity"
+    Author "Karthik+Antigravity"
     Version "1.0"
     Description "Lightweight Singularity image containing all tools to run the SmallSeq pipeline"
 
@@ -51,5 +51,5 @@ From: ubuntu:22.04
     
 
 %environment
-    export PATH=/opt/smallseq:/opt/smallseq/STAR-2.7.11b/bin/Linux_x86_64:/opt/calib/:$PATH
+    export PATH=/opt/smallseq:/opt/smallseq/STAR-2.7.11b/bin/Linux_x86_64:$PATH
     export PYTHONUNBUFFERED=1
