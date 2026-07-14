@@ -1,0 +1,13 @@
+# ── Genome references & indices ──────────────────────────────────────────────
+grch38/
+ref/
+star_grch38_ref/
+with_gencode_star_grch38_ref/
+
+# ── Singularity image ─────────────────────────────────────────────────────────
+*.sif
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
