@@ -122,12 +122,22 @@ python ../src/remove_reads_with_genomic_TGG.py -i starout_molc -o starout_molc_f
 python ../src/count_smallrnas.py -i starout_molc_final -g ../annotations/combined_annots.gp -o counts_molc -p $nprocs
 python ../src/merge_countsmallrnaoutput.py counts_molc.txt counts_molc/*/*_Count.txt
 ```
+The annotation must be built by `annotations/build_annotation.py`, which writes a 17th
+column naming the source database. That column drives the protocol's hierarchical
+assignment (miRBase > GtRNAdb > GENCODE) when a read overlaps annotations from more than
+one database. Older `.gp` files without it still run, but the hierarchy is disabled and a
+warning is printed.
 
-## Collapse multi miRNAs only, keep the rest of table intact
+## Collapse counts onto gene-level rows
 ```
 python ../src/collapse_mirnas_on_counts_molc.py -i counts_molc.txt -o counts_molc_final.txt
-rm counts_molc.txt
 ```
+By default this sums every row sharing a gene name, including copies of multi-copy
+families (Y_RNA, U6, ...) that short reads cannot tell apart. Column 2 of a collapsed
+row holds the number of transcripts summed into it.
+
+Pass `-l transcript` for the legacy layout instead: one row per transcript, with only
+miRBase mature miRNAs collapsed.
 
 ```
 The counts_molc_final.txt is a table containing molecule counts of all the RNA biotypes in the annotation table. If you get this file, it means the pipeline has been executed correctly.

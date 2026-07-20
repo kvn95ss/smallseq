@@ -64,11 +64,38 @@ def parse_attributes(attr_string):
             attrs[key] = val.replace('"', '').replace(';', '')
     return attrs
 
-def parse_gencode_gtf(gtf_path):
+def compute_exon_frames(exons, coding_blocks, strand):
+    """Compute the extended-GenePred exonFrames column.
+
+    coding_blocks is a list of (start, end, gtf_frame) taken from the GTF's CDS and
+    stop_codon lines. GTF frame counts bases to remove to reach the next codon;
+    GenePred stores the position of the exon's first coding base within its codon,
+    so the two are related by (3 - gtf_frame) % 3. Reading the frame off the GTF
+    rather than recomputing it keeps 5'-truncated CDSs (which do not begin on a
+    codon boundary) correct. Exons with no coding bases get -1.
+    """
+    frames = [-1] * len(exons)
+    if not coding_blocks:
+        return frames
+
+    for i, (ex_start, ex_end) in enumerate(exons):
+        overlapping = [b for b in coding_blocks
+                       if b[0] < ex_end and b[1] > ex_start]
+        if not overlapping:
+            continue
+        # The exon's frame comes from its first coding block in transcript order
+        first = min(overlapping) if strand == '+' else max(overlapping)
+        gtf_frame = first[2]
+        frames[i] = (3 - gtf_frame) % 3 if gtf_frame is not None else -1
+    return frames
+
+
+def parse_gencode_gtf(gtf_path, keep_tagene=False):
     print(f"Parsing GENCODE GTF: {gtf_path}...")
     transcripts_dict = {}  # Use dict keyed by transcript_id
     open_func = gzip.open if gtf_path.endswith('.gz') else open
-    
+    n_tagene_skipped = 0
+
     with open_func(gtf_path, 'rt') as f:
         for line in f:
             if line.startswith('#'):
@@ -76,19 +103,28 @@ def parse_gencode_gtf(gtf_path):
             parts = line.strip().split('\t')
             if len(parts) < 9:
                 continue
-            
+
             feature_type = parts[2]
-            if feature_type not in ('transcript', 'CDS', 'start_codon', 'stop_codon'):
+            if feature_type not in ('transcript', 'exon', 'CDS', 'start_codon', 'stop_codon'):
                 continue
-            
+
+            # GENCODE v43+ ships transcript models built from long-read data (TAGENE).
+            # They extend gene boundaries and massively inflate the annotated footprint,
+            # so drop them unless explicitly requested. The tag is repeated on every
+            # feature line of the transcript, so this check is safe per-line.
+            if not keep_tagene and 'tag "TAGENE"' in parts[8]:
+                if feature_type == 'transcript':
+                    n_tagene_skipped += 1
+                continue
+
             chrom = parts[0]
             strand = parts[6]
             attrs = parse_attributes(parts[8])
             tx_id = attrs.get('transcript_id', '')
-            
+
             if not tx_id:
                 continue
-            
+
             # Initialize transcript entry if not present
             if tx_id not in transcripts_dict:
                 transcripts_dict[tx_id] = {
@@ -100,68 +136,90 @@ def parse_gencode_gtf(gtf_path):
                     'tx_end': None,
                     'cds_start': None,
                     'cds_end': None,
+                    'exons': [],
+                    'coding_blocks': [],
+                    'stop_codon': None,
                     'has_start_codon': False,
                     'has_stop_codon': False
                 }
-            
+
             tx = transcripts_dict[tx_id]
-            
+
             if feature_type == 'transcript':
                 tx['tx_start'] = int(parts[3]) - 1  # 0-based
                 tx['tx_end'] = int(parts[4])
-            elif feature_type == 'CDS':
-                cds_start_1based = int(parts[3]) - 1  # Convert to 0-based
-                cds_end = int(parts[4])
-                # Track the minimum start and maximum end of all CDS features
-                if tx['cds_start'] is None:
-                    tx['cds_start'] = cds_start_1based
-                    tx['cds_end'] = cds_end
+            elif feature_type == 'exon':
+                tx['exons'].append((int(parts[3]) - 1, int(parts[4])))
+            elif feature_type in ('CDS', 'stop_codon'):
+                blk_start = int(parts[3]) - 1  # Convert to 0-based
+                blk_end = int(parts[4])
+                frame = int(parts[7]) if parts[7] != '.' else None
+                tx['coding_blocks'].append((blk_start, blk_end, frame))
+
+                if feature_type == 'CDS':
+                    # Track the minimum start and maximum end of all CDS features
+                    if tx['cds_start'] is None:
+                        tx['cds_start'] = blk_start
+                        tx['cds_end'] = blk_end
+                    else:
+                        tx['cds_start'] = min(tx['cds_start'], blk_start)
+                        tx['cds_end'] = max(tx['cds_end'], blk_end)
                 else:
-                    tx['cds_start'] = min(tx['cds_start'], cds_start_1based)
-                    tx['cds_end'] = max(tx['cds_end'], cds_end)
+                    tx['has_stop_codon'] = True
+                    if tx['stop_codon'] is None:
+                        tx['stop_codon'] = (blk_start, blk_end)
+                    else:  # stop codon can be split across an intron
+                        tx['stop_codon'] = (min(tx['stop_codon'][0], blk_start),
+                                            max(tx['stop_codon'][1], blk_end))
             elif feature_type == 'start_codon':
                 tx['has_start_codon'] = True
-            elif feature_type == 'stop_codon':
-                tx['has_stop_codon'] = True
-    
+
     # Convert to list and determine CDS status
     transcripts = []
     for tx_id, tx in transcripts_dict.items():
         # Skip entries without tx_start/tx_end (malformed)
         if tx['tx_start'] is None or tx['tx_end'] is None:
             continue
-        
-        # Determine cdsStartStat and cdsEndStat
-        cds_start_stat = 'none'
-        cds_end_stat = 'none'
-        
+
+        # Exon blocks must be in ascending genomic order for GenePred
+        tx['exons'].sort()
+        if not tx['exons']:
+            # No exon lines seen; fall back to the full transcript span
+            tx['exons'] = [(tx['tx_start'], tx['tx_end'])]
+
+        # GENCODE excludes the stop codon from its CDS features; UCSC GenePred
+        # includes it. Fold the stop codon back into the CDS bounds.
+        if tx['cds_start'] is not None and tx['stop_codon'] is not None:
+            tx['cds_start'] = min(tx['cds_start'], tx['stop_codon'][0])
+            tx['cds_end'] = max(tx['cds_end'], tx['stop_codon'][1])
+
+        # Determine completeness at the 5' and 3' ends of the CDS, in transcript
+        # orientation:
+        # 'cmpl'   = codon present
+        # 'incmpl' = codon missing (truncated model)
+        # 'none'   = no CDS at all
+        five_prime_stat = 'none'
+        three_prime_stat = 'none'
+
         if tx['cds_start'] is not None and tx['cds_end'] is not None:
-            # Has CDS - determine completeness
-            # 'cmpl' = complete (has both start and stop codons in frame)
-            # 'incmpl' = incomplete (missing start codon, stop codon, or both)
-            # 'unk' = unknown (couldn't determine)
-            
-            if tx['has_start_codon']:
-                cds_start_stat = 'cmpl'
-            elif tx['cds_start'] == tx['tx_start']:
-                # If CDS starts at transcript start, likely has start codon
-                cds_start_stat = 'cmpl'
-            else:
-                cds_start_stat = 'incmpl'
-            
-            if tx['has_stop_codon']:
-                cds_end_stat = 'cmpl'
-            elif tx['cds_end'] == tx['tx_end']:
-                # If CDS ends at transcript end, likely has stop codon
-                cds_end_stat = 'cmpl'
-            else:
-                cds_end_stat = 'incmpl'
-        
-        tx['cds_start_stat'] = cds_start_stat
-        tx['cds_end_stat'] = cds_end_stat
-        
+            five_prime_stat = 'cmpl' if tx['has_start_codon'] else 'incmpl'
+            three_prime_stat = 'cmpl' if tx['has_stop_codon'] else 'incmpl'
+
+        # cdsStartStat/cdsEndStat are in GENOMIC order, so on the minus strand the
+        # genomic cdsStart is the transcript's 3' end.
+        if tx['strand'] == '-':
+            tx['cds_start_stat'] = three_prime_stat
+            tx['cds_end_stat'] = five_prime_stat
+        else:
+            tx['cds_start_stat'] = five_prime_stat
+            tx['cds_end_stat'] = three_prime_stat
+        tx['exon_frames'] = compute_exon_frames(
+            tx['exons'], tx['coding_blocks'], tx['strand'])
+
         transcripts.append(tx)
-    
+
+    if not keep_tagene and n_tagene_skipped:
+        print(f"Skipped {n_tagene_skipped} TAGENE (long-read) transcripts.")
     print(f"Loaded {len(transcripts)} transcripts from GENCODE.")
     return transcripts
 
@@ -286,13 +344,24 @@ def parse_trna_file(trna_path):
     print(f"Loaded {count} tRNAs.")
     return transcripts
 
-def write_extended_genepred(fh, tx_id, chrom, strand, start, end, gene_name, 
-                            cds_start_stat='none', cds_end_stat='none', score=0):
+def write_extended_genepred(fh, tx_id, chrom, strand, start, end, gene_name,
+                            cds_start_stat='none', cds_end_stat='none', score=0,
+                            exons=None, cds_start=None, cds_end=None, exon_frames=None,
+                            source='gencode'):
     """Writes a single transcript model in extended GenePred format to file handle
-    
+
     Parameters:
+    - exons: list of (exonStart, exonEnd) 0-based half-open blocks in ascending
+      genomic order. Defaults to a single block spanning start..end, which is
+      correct for the intrinsically single-exon features (miRNAs, tRNAs, spike-ins).
+    - cds_start/cds_end: CDS bounds. For non-coding models GenePred convention is
+      cdsStart == cdsEnd == txEnd.
+    - exon_frames: per-exon reading frame, -1 for non-coding exons.
     - cds_start_stat: 'none', 'unk', 'cmpl', or 'incmpl' (completeness of CDS start)
     - cds_end_stat: 'none', 'unk', 'cmpl', or 'incmpl' (completeness of CDS end)
+    - source: originating database. Written as a 17th column so the counter can apply
+      the protocol's hierarchical assignment (miRBase > GtRNAdb > GENCODE). Columns
+      0-15 remain a valid extended GenePred for any other consumer.
     """
     # Extended GenePred columns:
     # 0. bin (always 0 here)
@@ -301,16 +370,28 @@ def write_extended_genepred(fh, tx_id, chrom, strand, start, end, gene_name,
     # 3. strand
     # 4. txStart
     # 5. txEnd
-    # 6. cdsStart (same as txStart)
-    # 7. cdsEnd (same as txEnd)
-    # 8. exonCount (1 exon representing the full locus span)
-    # 9. exonStarts (start,)
-    # 10. exonEnds (end,)
+    # 6. cdsStart
+    # 7. cdsEnd
+    # 8. exonCount
+    # 9. exonStarts (comma-terminated)
+    # 10. exonEnds (comma-terminated)
     # 11. score (default 0)
     # 12. name2 (gene name/symbol)
     # 13. cdsStartStat ('none', 'unk', 'cmpl', 'incmpl')
     # 14. cdsEndStat ('none', 'unk', 'cmpl', 'incmpl')
-    # 15. exonFrames (-1)
+    # 15. exonFrames (comma-terminated)
+    if exons is None:
+        exons = [(start, end)]
+    if cds_start is None or cds_end is None:
+        # Non-coding: GenePred marks this with an empty CDS at txEnd
+        cds_start = cds_end = end
+    if exon_frames is None:
+        exon_frames = [-1] * len(exons)
+
+    exon_starts = ",".join(str(s) for s, _ in exons) + ","
+    exon_ends = ",".join(str(e) for _, e in exons) + ","
+    frames = ",".join(str(fr) for fr in exon_frames) + ","
+
     line_parts = [
         "0",
         tx_id,
@@ -318,16 +399,17 @@ def write_extended_genepred(fh, tx_id, chrom, strand, start, end, gene_name,
         strand,
         str(start),
         str(end),
-        str(start),
-        str(end),
-        "1",
-        f"{start},",
-        f"{end},",
+        str(cds_start),
+        str(cds_end),
+        str(len(exons)),
+        exon_starts,
+        exon_ends,
         str(score),
         gene_name,
         cds_start_stat,
         cds_end_stat,
-        "-1"
+        frames,
+        source  # col 16: source database, for hierarchical assignment
     ]
     fh.write("\t".join(line_parts) + "\n")
 
@@ -338,6 +420,10 @@ def main():
     parser.add_argument("-t", "--trna", help="Path to tRNA file (GtRNAdb GFF3 or UCSC txt.gz format)")
     parser.add_argument("-o", "--output", default="combined_annots.gp", help="Output GenePred file path")
     parser.add_argument("--download", action="store_true", help="Download missing files automatically")
+    parser.add_argument("--keep-tagene", action="store_true",
+                        help="Keep TAGENE long-read transcript models (GENCODE v43+). "
+                             "Excluded by default: they extend gene boundaries and inflate "
+                             "the annotated footprint relative to legacy releases.")
     args = parser.parse_args()
 
     # Create directories if they don't exist
@@ -374,7 +460,7 @@ def main():
         sys.exit(1)
 
     # Parse all databases
-    gencode_transcripts = parse_gencode_gtf(gencode_file)
+    gencode_transcripts = parse_gencode_gtf(gencode_file, keep_tagene=args.keep_tagene)
     mirbase_miRNAs = parse_mirbase_gff3(mirbase_file)
     trnas = parse_trna_file(trna_file)
 
@@ -383,25 +469,30 @@ def main():
     with open(args.output, "w") as out:
         # 1. Write miRNAs
         for tx in mirbase_miRNAs:
-            write_extended_genepred(out, tx['id'], tx['chrom'], tx['strand'], tx['start'], tx['end'], tx['gene_name'])
-        
-        # 2. Write GENCODE transcripts (with CDS status values)
+            write_extended_genepred(out, tx['id'], tx['chrom'], tx['strand'], tx['start'], tx['end'], tx['gene_name'],
+                                  source='mirbase')
+
+        # 2. Write GENCODE transcripts (with exon blocks and CDS status values)
         for tx in gencode_transcripts:
-            write_extended_genepred(out, tx['id'], tx['chrom'], tx['strand'], tx['tx_start'], tx['tx_end'], 
-                                  tx['gene_name'], cds_start_stat=tx['cds_start_stat'], cds_end_stat=tx['cds_end_stat'])
-        
+            write_extended_genepred(out, tx['id'], tx['chrom'], tx['strand'], tx['tx_start'], tx['tx_end'],
+                                  tx['gene_name'], cds_start_stat=tx['cds_start_stat'], cds_end_stat=tx['cds_end_stat'],
+                                  exons=tx['exons'], cds_start=tx['cds_start'], cds_end=tx['cds_end'],
+                                  exon_frames=tx['exon_frames'], source='gencode')
+
         # 3. Write tRNAs
         for tx in trnas:
-            write_extended_genepred(out, tx['id'], tx['chrom'], tx['strand'], tx['start'], tx['end'], tx['gene_name'])
+            write_extended_genepred(out, tx['id'], tx['chrom'], tx['strand'], tx['start'], tx['end'], tx['gene_name'],
+                                  source='gtrnadb')
 
         # 4. Write Custom rRNA
         for tx_id, gene_name, chrom, strand, start, end in CUSTOM_RRNA:
-            write_extended_genepred(out, tx_id, chrom, strand, start, end, gene_name)
+            write_extended_genepred(out, tx_id, chrom, strand, start, end, gene_name, source='rrna')
 
         # 5. Write Spike-ins
         for tx_id, gene_name, strand, start, end, score in SPIKE_INS:
             # Note: Spike-ins map to their own artificial chromosome named after the spike-in
-            write_extended_genepred(out, tx_id, tx_id, strand, start, end, gene_name, score=score)
+            write_extended_genepred(out, tx_id, tx_id, strand, start, end, gene_name, score=score,
+                                  source='spikein')
 
     print("Success! Custom annotation file generated successfully.")
 

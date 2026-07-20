@@ -31,6 +31,7 @@ from functools import partial
 import time
 import json
 import bisect
+import gzip
 
 # Try to import optional dependencies
 try:
@@ -48,6 +49,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Hierarchical assignment order from the Small-seq protocol: "Mirbase (miRNAs), GtRNAdb
+# (tRNAs), and Gencode transcripts". Lower number wins. Spike-ins and the custom rRNA loci
+# sit alongside GENCODE — they never compete with a miRNA or tRNA for the same read.
+SOURCE_PRIORITY = {
+    'mirbase': 0,
+    'gtrnadb': 1,
+    'gencode': 2,
+    'rrna': 2,
+    'spikein': 2,
+}
+
+
 class SmallSeqPipeline:
     """Main pipeline class for SmallSeq data processing"""
 
@@ -60,8 +73,9 @@ class SmallSeqPipeline:
         "UMI Deduplication",
         "Precursor Removal",
         "Count Generation",
+        "Long-read Counting",
         "Count Merging",
-        "miRNA Collapsing",
+        "Count Collapsing",
         "Reporting",
     ]
 
@@ -137,13 +151,58 @@ class SmallSeqPipeline:
         self.config.setdefault('allowed_3p_clip', 3)
         self.config.setdefault('dedup_method', 'adjacency')
         self.config.setdefault('legacy_count', False)
-        
+        self.config.setdefault('collapse_level', 'gene')
+
     def safe_mkdir(self, path):
         """Create directory if it doesn't exist"""
         if not os.path.exists(path):
             os.makedirs(path, mode=0o774)
             logger.info(f"Created directory: {path}")
-    
+
+    def get_untrimmed_max_len(self):
+        """Longest read seen after UMI+CA removal but before length filtering.
+
+        The protocol derives its length thresholds from the sequencing read length: with a
+        51bp run, 51 - 8 (UMI) - 2 (CA) = 41, hence maxRlen=40/minRlen=41. Step 8's precursor
+        check reconstructs "the read was this long before adapter trimming", so it needs the
+        REAL value, not min_read_len — which is only correct for a 51bp run. Detect it once
+        from the step-2 FASTQs and cache it.
+        """
+        if self.config.get('untrimmed_max_len'):
+            return self.config['untrimmed_max_len']
+
+        trimmed_dir = os.path.join(self.config['output_dir'], 'step2_adapter_trimmed')
+        maxlen = 0
+        for sample in self.samples:
+            fq = os.path.join(trimmed_dir, sample, f"{sample}.fastq.gz")
+            if not os.path.exists(fq):
+                continue
+            with gzip.open(fq, 'rt') as fh:
+                for i, line in enumerate(fh):
+                    if i % 4 == 1:
+                        maxlen = max(maxlen, len(line.strip()))
+                    if i > 400000:  # a couple of hundred thousand reads is plenty
+                        break
+            if maxlen:
+                break
+
+        if not maxlen:
+            maxlen = self.config['min_read_len']
+            logger.warning(f"Could not detect untrimmed read length; falling back to "
+                           f"min_read_len={maxlen}. Step 8 may filter the wrong lengths.")
+        else:
+            logger.info(f"Detected untrimmed max read length: {maxlen}nt "
+                        f"(sequencing length minus 8nt UMI and 2nt CA)")
+            if maxlen != self.config['min_read_len']:
+                logger.warning(
+                    f"min_read_len={self.config['min_read_len']} but the real untrimmed length "
+                    f"is {maxlen}nt. Step 8's precursor check will use {maxlen}; reads longer "
+                    f"than max_read_len={self.config['max_read_len']} go to step6_long/.")
+
+        self.config['untrimmed_max_len'] = maxlen
+        return maxlen
+
+
     def run(self):
         """Execute the complete pipeline"""
         logger.info("="*60)
@@ -167,9 +226,10 @@ class SmallSeqPipeline:
             self.step7_umi_dedup,
             self.step8_remove_precursors,
             self.step9_count_smallrnas,
-            self.step10_merge_counts,
-            self.step11_collapse_mirnas,
-            self.step12_reporting,
+            self.step10_count_long,
+            self.step11_merge_counts,
+            self.step12_collapse_counts,
+            self.step13_reporting,
         ]
         steps = list(zip(self.STEP_NAMES, step_funcs))
         
@@ -493,19 +553,40 @@ class SmallSeqPipeline:
         sample_out = os.path.join(output_dir, sample)
         self.safe_mkdir(sample_out)
         
+        long_dir = os.path.join(self.config['output_dir'], 'step6_long')
+        long_out = os.path.join(long_dir, sample)
+        self.safe_mkdir(long_out)
+
         inbam = os.path.join(input_dir, sample, f"{sample}.bam")
         outbam = os.path.join(sample_out, f"{sample}.bam")
-        
+        longbam = os.path.join(long_out, f"{sample}.bam")
+
+        maxlen = self.config['max_read_len']
+
+        # Reads longer than the cap are NOT small RNAs by the protocol's definition, but they
+        # are real data (tRNA/snoRNA fragments) — route them to step6_long/ instead of
+        # discarding. With 101bp sequencing this is >50% of the library.
         cmd = f"samtools view -h {inbam} | " \
-              f"awk 'length($10) <= {self.config['max_read_len']} || $1~\"@\"' | " \
+              f"awk 'length($10) <= {maxlen} || $1~\"@\"' | " \
               f"samtools view -bS - > {outbam}"
-        
-        #subprocess.run(cmd, shell=True, check=True)
         result = subprocess.run(cmd,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True)
         if result.returncode !=0:
             logger.warning(f"Filtering warning for {sample}: {result.stderr}")
 
+        long_cmd = f"samtools view -h {inbam} | " \
+                   f"awk 'length($10) > {maxlen} || $1~\"@\"' | " \
+                   f"samtools view -bS - > {longbam}"
+        result = subprocess.run(long_cmd,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,universal_newlines=True)
+        if result.returncode != 0:
+            logger.warning(f"Long-read split warning for {sample}: {result.stderr}")
+
         pysam.index(outbam)
+        pysam.index(longbam)
+
+        n_short = int(pysam.view("-c", outbam).strip() or 0)
+        n_long = int(pysam.view("-c", longbam).strip() or 0)
+        logger.info(f"{sample}: {n_short} alignments <={maxlen}nt -> step6_max{maxlen}, "
+                    f"{n_long} >{maxlen}nt -> step6_long")
 
         input_flagstat = os.path.join(sample_out, f"{sample}_input_flagstat.txt")
         output_flagstat = os.path.join(sample_out, f"{sample}_output_flagstat.txt")
@@ -516,19 +597,31 @@ class SmallSeqPipeline:
                 logger.warning(f"flagstat warning for {sample}: {result.stderr}")
     
     def step6_filter_by_length(self):
-        """Filter reads by length"""
+        """Split reads by length: <=max_read_len are small RNAs, longer ones are kept aside
+
+        Long reads are not discarded — they go to step6_long/ for the separate tRNA/MINTmap
+        pipeline. Nothing downstream in this pipeline consumes them.
+        """
         output_dir = os.path.join(self.config['output_dir'], f'step6_max{self.config["max_read_len"]}')
         self.safe_mkdir(output_dir)
-        
+        self.safe_mkdir(os.path.join(self.config['output_dir'], 'step6_long'))
+
         with Pool(self.config['threads']) as pool:
             pool.map(self._process_readlen_sample, self.samples)
     
     # ===== Step 7: UMI Deduplication =====
-    def _process_dedup_sample(self, sample):
-        """Process a single sample for UMI deduplication"""
-        input_dir = os.path.join(self.config['output_dir'], f'step6_max{self.config["max_read_len"]}')
-        output_dir = os.path.join(self.config['output_dir'], 'step7_dedup')
-        
+    def _process_dedup_sample(self, sample, stage=''):
+        """Process a single sample for UMI deduplication
+
+        stage='' processes the small-RNA path (step6_max{N} -> step7_dedup).
+        stage='_long' processes the >max_read_len path (step6_long -> step7_dedup_long).
+        """
+        if stage == '_long':
+            input_dir = os.path.join(self.config['output_dir'], 'step6_long')
+        else:
+            input_dir = os.path.join(self.config['output_dir'], f'step6_max{self.config["max_read_len"]}')
+        output_dir = os.path.join(self.config['output_dir'], f'step7_dedup{stage}')
+
         sample_out = os.path.join(output_dir, sample)
         self.safe_mkdir(sample_out)
         
@@ -552,16 +645,20 @@ class SmallSeqPipeline:
         """Remove PCR duplicates using UMI"""
         output_dir = os.path.join(self.config['output_dir'], 'step7_dedup')
         self.safe_mkdir(output_dir)
-        
+
         with Pool(self.config['threads']) as pool:
             pool.map(self._process_dedup_sample, self.samples)
     
     # ===== Step 8: Precursor Removal =====
-    def _process_precursor_sample(self, sample, gf):
-        """Process a single sample for precursor removal"""
-        input_dir = os.path.join(self.config['output_dir'], 'step7_dedup')
-        output_dir = os.path.join(self.config['output_dir'], 'step8_precursor_removed')
-        
+    def _process_precursor_sample(self, sample, gf, stage=''):
+        """Process a single sample for precursor removal
+
+        stage='' is the small-RNA path; stage='_long' is the >max_read_len path. The check is
+        most meaningful on the long path: those are the max-length reads it was designed for.
+        """
+        input_dir = os.path.join(self.config['output_dir'], f'step7_dedup{stage}')
+        output_dir = os.path.join(self.config['output_dir'], f'step8_precursor_removed{stage}')
+
         sample_out = os.path.join(output_dir, sample)
         self.safe_mkdir(sample_out)
         
@@ -572,6 +669,13 @@ class SmallSeqPipeline:
         inbam_obj = pysam.AlignmentFile(inbam, "rb")
         outbam_obj = pysam.AlignmentFile(outbam_tmp, "wb", template=inbam_obj)
 
+        # A read only needs the precursor check if adapter trimming could plausibly have
+        # eaten just a base or two off a FULL-LENGTH read. That means keying on the real
+        # untrimmed read length, not min_read_len (which is only equal to it for a 51bp run).
+        # Using min_read_len on longer sequencing runs makes this filter fire on genuine
+        # small RNAs and destroy them.
+        untrimmed = self.config['untrimmed_max_len']
+
         total, kept = 0, 0
         for read in inbam_obj:
             total += 1
@@ -581,45 +685,39 @@ class SmallSeqPipeline:
                 outbam_obj.write(read)
                 kept += 1
                 continue
-            
+
             readchr = inbam_obj.get_reference_name(read.reference_id)
             readstart = read.pos + 1
             readend = read.reference_end
-            
-            minRlen = self.config['min_read_len']
-            upperlimit = minRlen - readlen
-            
-            # Default to dropping the read — matches original behavior where
-            # non-canonical flags (anything except forward 0 or reverse 16) are silently discarded
-            keep_read = False
-            if read.flag == 0:  # Forward strand
-                bpwindow = gf.get_seq_from_to(readchr, readend+1, readend+upperlimit)
-                patterns = {
-                    minRlen-1: ["T", "A"],
-                    minRlen-2: ["TG", "AA"],
-                    minRlen-3: ["TGG", "AAA"],
-                    minRlen-4: ["TGGA", "AAAA"],
-                    minRlen-5: ["TGGAA", "AAAAA"]
-                }
+
+            upperlimit = untrimmed - readlen
+
+            # Keep by default. Only an actual adapter-lookalike in the genome removes a read.
+            # (The original keyed on flag == 0 / 16, which silently dropped every secondary
+            # alignment of a read longer than 35nt and broke multi-mapper weighting.)
+            keep_read = True
+            if 0 < upperlimit <= 5:
+                if not read.is_reverse:
+                    bpwindow = gf.get_seq_from_to(readchr, readend+1, readend+upperlimit)
+                    patterns = {
+                        untrimmed-1: ["T", "A"],
+                        untrimmed-2: ["TG", "AA"],
+                        untrimmed-3: ["TGG", "AAA"],
+                        untrimmed-4: ["TGGA", "AAAA"],
+                        untrimmed-5: ["TGGAA", "AAAAA"]
+                    }
+                else:
+                    bpwindow = gf.get_seq_from_to(readchr, readstart-upperlimit, readstart-1)
+                    patterns = {
+                        untrimmed-1: ["A", "T"],
+                        untrimmed-2: ["CA", "TT"],
+                        untrimmed-3: ["CCA", "TTT"],
+                        untrimmed-4: ["TCCA", "TTTT"],
+                        untrimmed-5: ["TTCCA", "TTTTT"]
+                    }
                 if readlen in patterns and bpwindow in patterns[readlen]:
                     keep_read = False
-                else:
-                    keep_read = True
-                    
-            elif read.flag == 16:  # Reverse strand
-                bpwindow = gf.get_seq_from_to(readchr, readstart-upperlimit, readstart-1)
-                patterns = {
-                    minRlen-1: ["A", "T"],
-                    minRlen-2: ["CA", "TT"],
-                    minRlen-3: ["CCA", "TTT"],
-                    minRlen-4: ["TCCA", "TTTT"],
-                    minRlen-5: ["TTCCA", "TTTTT"]
-                }
-                if readlen in patterns and bpwindow in patterns[readlen]:
-                    keep_read = False
-                else:
-                    keep_read = True
-            
+
             if keep_read:
                 outbam_obj.write(read)
                 kept += 1
@@ -638,32 +736,42 @@ class SmallSeqPipeline:
             fh.write(f"kept_reads\t{kept}\n")
             fh.write(f"removed_pct\t{100*(1-kept/total):.2f}\n")
 
-    def _process_precursor_sample_parallel(self, sample):
+    def _process_precursor_sample_parallel(self, sample, stage=''):
         """Worker-safe wrapper: creates its own GenomeFetch instance per process"""
         sys.path.insert(0, os.path.dirname(__file__))
         from GenomeFetch import GenomeFetch
         gf = GenomeFetch(genomedir=self.config['genome_fasta'])
-        self._process_precursor_sample(sample, gf)
+        self._process_precursor_sample(sample, gf, stage=stage)
 
     def step8_remove_precursors(self):
         """Remove reads from precursor RNAs based on genomic context"""
         output_dir = os.path.join(self.config['output_dir'], 'step8_precursor_removed')
         self.safe_mkdir(output_dir)
-        
+
+        # Resolve before forking so every worker inherits the same value
+        self.get_untrimmed_max_len()
+
         with Pool(self.config['threads']) as pool:
             pool.map(self._process_precursor_sample_parallel, self.samples)
     
     # ===== Step 9: Count Small RNAs =====
     def _process_count_sample(self, sample, interval_lists, interval_starts, max_interval_len,
-                              coord2geneid, geneid2name, geneidlist, legacy_count):
+                              coord2geneid, geneid2name, geneidlist, legacy_count,
+                              stage='', exclude_prios=frozenset()):
         """Process a single sample for counting using gene annotations
 
         This function is designed to be called safely in parallel via multiprocessing.Pool.
         It uses a locally-scoped midpos variable, making it thread-safe (unlike the original
         count_smallrnas.py which had a global midpos variable bug that forced serial execution).
+
+        exclude_prios: source priorities that may not be assigned. The long path passes
+        miRBase's priority: mature miRNAs are 16-28nt, so a 41-91nt read can never BE one, but
+        the overlap test is an intersection and would happily match a read that merely grazes
+        one -- and miRBase outranks GENCODE, so that graze would discard the correct host-gene
+        assignment.
         """
-        input_dir = os.path.join(self.config['output_dir'], 'step8_precursor_removed')
-        output_dir = os.path.join(self.config['output_dir'], 'step9_counts')
+        input_dir = os.path.join(self.config['output_dir'], f'step8_precursor_removed{stage}')
+        output_dir = os.path.join(self.config['output_dir'], f'step9_counts{stage}')
 
         sample_out = os.path.join(output_dir, sample)
         self.safe_mkdir(sample_out)
@@ -673,20 +781,33 @@ class SmallSeqPipeline:
 
         def find_overlaps(chrom, qstart, qend, strand):
             """Find gene intervals overlapping [qstart, qend] using bisect O(log n) lookup.
-            For legacy midpoint mode, pass qstart == qend == midpos."""
+            For legacy midpoint mode, pass qstart == qend == midpos.
+
+            Applies the protocol's hierarchical assignment: when a read overlaps annotations
+            from several databases, only the highest-priority source is kept
+            (miRBase > GtRNAdb > GENCODE). Ties within that source are returned together so
+            the caller's 1/annotatedCount weighting still applies.
+            """
             key = (chrom, strand)
             if key not in interval_lists:
                 return []
             ivs = interval_lists[key]
             starts = interval_starts[key]
             i = bisect.bisect_right(starts, qend) - 1
-            overlaps = []
+            hits = []
+            best = None
             while i >= 0 and starts[i] >= qstart - max_interval_len:
-                start, end, geneid = ivs[i]
-                if end >= qstart:
-                    overlaps.append(f"{chrom}:{start+1}-{end}:{strand}")
+                start, end, geneid, prio = ivs[i]
+                # Skipped before the priority reduction, so an excluded source can neither be
+                # assigned nor suppress a legitimate lower-priority hit.
+                if end >= qstart and prio not in exclude_prios:
+                    hits.append((prio, f"{chrom}:{start+1}-{end}:{strand}"))
+                    if best is None or prio < best:
+                        best = prio
                 i -= 1
-            return overlaps
+            if best is None:
+                return []
+            return [coord for prio, coord in hits if prio == best]
 
         inbam_obj = pysam.AlignmentFile(inbam, "rb")
 
@@ -736,28 +857,21 @@ class SmallSeqPipeline:
         
         num_annot = sum(v for k, v in geneid2counts.items() if k != 'NA' and not k.startswith('P-cel'))
         
-        # Write output
+        # Write output. The long pass labels its column {sample}_long so it stays distinct
+        # from the small-RNA column when the two are merged side by side.
+        col_name = f"{sample}_long" if stage == '_long' else sample
         with open(outfile, 'w') as fh:
-            fh.write(f"#samples\t{sample}\n")
+            fh.write(f"#samples\t{col_name}\n")
             fh.write(f"#unannotatedmolc\t{num_unannot}\n")
             fh.write(f"#annotatedmolc\t{num_annot}\n")
             for geneid in geneidlist:
                 fh.write(f"{geneid2name[geneid]}\t{geneid}\t{geneid2counts.get(geneid, 0)}\n")
     
-    def step9_count_smallrnas(self):
-        """Count small RNAs using gene annotation file
-        
-        PARALLELIZATION NOTE: The original pipeline's count_smallrnas.py had parallelization 
-        disabled due to a global 'midpos' variable bug that corrupted results in parallel 
-        (see src/count_smallrnas.py line 139 comment). This version fixes that bug by using 
-        locally-scoped variables in _process_count_sample(), enabling safe parallel execution 
-        via multiprocessing.Pool. This provides significant performance improvement over the 
-        original serial implementation.
+    def _load_annotation(self):
+        """Parse the GenePred annotation into bisect-ready per-(chrom,strand) exon intervals.
+
+        Shared by the small-RNA and long-read counting passes.
         """
-        output_dir = os.path.join(self.config['output_dir'], 'step9_counts')
-        self.safe_mkdir(output_dir)
-        
-        # Load annotation
         geneid2name = {}
         coord2geneid = {}
         geneidlist = []
@@ -767,18 +881,41 @@ class SmallSeqPipeline:
         interval_lists = {}
         max_interval_len = 0
 
+        missing_source = False
         for line in open(self.config['annotation'], 'r'):
             p = line.split()
-            chrom, start, end, strand, geneid, genename = p[2], int(p[4]), int(p[5]), p[3], p[1], p[12]
+            chrom, strand, geneid, genename = p[2], p[3], p[1], p[12]
+            # Col 16 is the source database, written by build_annotation.py. Older .gp files
+            # do not have it; fall back to a flat priority so they still run.
+            if len(p) > 16:
+                source = p[16]
+            else:
+                source = 'gencode'
+                missing_source = True
+            prio = SOURCE_PRIORITY.get(source, SOURCE_PRIORITY['gencode'])
+
             key = (chrom, strand)
             if key not in interval_lists:
                 interval_lists[key] = []
-            interval_lists[key].append((start, end, geneid))
-            max_interval_len = max(max_interval_len, end - start)
-            coord = f"{chrom}:{start+1}-{end}:{strand}"
-            coord2geneid[coord] = geneid
+
+            # One interval per EXON, not one spanning txStart..txEnd. A transcript-span
+            # window makes every intron part of the gene's counting window, which is how
+            # intronic reads were being credited to protein-coding genes.
+            exon_starts = [int(x) for x in p[9].rstrip(',').split(',')]
+            exon_ends = [int(x) for x in p[10].rstrip(',').split(',')]
+            for start, end in zip(exon_starts, exon_ends):
+                interval_lists[key].append((start, end, geneid, prio))
+                max_interval_len = max(max_interval_len, end - start)
+                coord = f"{chrom}:{start+1}-{end}:{strand}"
+                coord2geneid[coord] = geneid
+
             geneid2name[geneid] = genename
             geneidlist.append(geneid)
+
+        if missing_source:
+            logger.warning(
+                "Annotation has no source column (col 17) — hierarchical assignment "
+                "(miRBase > GtRNAdb > GENCODE) is DISABLED. Regenerate with build_annotation.py.")
 
         # Sort by start and build parallel start lists for bisect
         interval_starts = {}
@@ -786,29 +923,87 @@ class SmallSeqPipeline:
             interval_lists[key].sort()
             interval_starts[key] = [iv[0] for iv in interval_lists[key]]
 
+        return dict(interval_lists=interval_lists,
+                    interval_starts=interval_starts,
+                    max_interval_len=max_interval_len,
+                    coord2geneid=coord2geneid,
+                    geneid2name=geneid2name,
+                    geneidlist=geneidlist)
+
+    def _run_counting(self, stage='', exclude_prios=frozenset()):
+        """Count one BAM stage against the annotation, in parallel across samples."""
+        self.safe_mkdir(os.path.join(self.config['output_dir'], f'step9_counts{stage}'))
+        annot = self._load_annotation()
         count_func = partial(self._process_count_sample,
-                             interval_lists=interval_lists,
-                             interval_starts=interval_starts,
-                             max_interval_len=max_interval_len,
-                             coord2geneid=coord2geneid,
-                             geneid2name=geneid2name,
-                             geneidlist=geneidlist,
-                             legacy_count=self.config['legacy_count'])
+                             legacy_count=self.config['legacy_count'],
+                             stage=stage,
+                             exclude_prios=exclude_prios,
+                             **annot)
         with Pool(self.config['threads']) as pool:
             pool.map(count_func, self.samples)
-    
-    # ===== Step 10: Merge Counts =====
-    def step10_merge_counts(self):
-        """Merge count files from all samples"""
+
+    def step9_count_smallrnas(self):
+        """Count small RNAs using gene annotation file
+
+        PARALLELIZATION NOTE: The original pipeline's count_smallrnas.py had parallelization
+        disabled due to a global 'midpos' variable bug that corrupted results in parallel
+        (see src/count_smallrnas.py line 139 comment). This version fixes that bug by using
+        locally-scoped variables in _process_count_sample(), enabling safe parallel execution
+        via multiprocessing.Pool. This provides significant performance improvement over the
+        original serial implementation.
+        """
+        self._run_counting()
+
+    # ===== Step 10: Count the long-read fraction =====
+    def step10_count_long(self):
+        """Dedup, precursor-filter and count the >max_read_len reads set aside by step 6.
+
+        These reads are NOT small RNAs by the protocol's definition, but they are real data
+        (tRNA fragments are 55-176nt, snoRNAs longer). They run the same 7/8/9 path as the
+        small-RNA fraction so their counts are UMI-deduplicated MOLECULES on the same footing,
+        with one difference: miRBase is excluded as an assignment target (see
+        _process_count_sample).
+        """
+        long_dir = os.path.join(self.config['output_dir'], 'step6_long')
+        if not os.path.isdir(long_dir):
+            logger.info("No step6_long/ directory; skipping long-read counting.")
+            return
+
+        self.safe_mkdir(os.path.join(self.config['output_dir'], 'step7_dedup_long'))
+        with Pool(self.config['threads']) as pool:
+            pool.map(partial(self._process_dedup_sample, stage='_long'), self.samples)
+
+        self.safe_mkdir(os.path.join(self.config['output_dir'], 'step8_precursor_removed_long'))
+        self.get_untrimmed_max_len()
+        with Pool(self.config['threads']) as pool:
+            pool.map(partial(self._process_precursor_sample_parallel, stage='_long'), self.samples)
+
+        self._run_counting(stage='_long',
+                           exclude_prios=frozenset({SOURCE_PRIORITY['mirbase']}))
+
+
+    # ===== Step 11: Merge Counts =====
+    def step11_merge_counts(self):
+        """Merge count files from all samples
+
+        Emits the small-RNA column per sample followed by, where present, that sample's
+        long-read column ({sample}_long). The long columns are purely additive: the small-RNA
+        columns are byte-identical to a run without long-read counting.
+        """
         input_dir = os.path.join(self.config['output_dir'], 'step9_counts')
+        long_dir = os.path.join(self.config['output_dir'], 'step9_counts_long')
         output_file = os.path.join(self.config['output_dir'], 'counts_molc.txt')
-        
+
         count_files = []
         for sample in self.samples:
             count_file = os.path.join(input_dir, sample, f"{sample}_Count.txt")
             if os.path.exists(count_file):
                 count_files.append(count_file)
-        
+        for sample in self.samples:
+            long_file = os.path.join(long_dir, sample, f"{sample}_Count.txt")
+            if os.path.exists(long_file):
+                count_files.append(long_file)
+
         if not count_files:
             logger.error("No count files found!")
             return
@@ -843,43 +1038,61 @@ class SmallSeqPipeline:
         
         logger.info(f"Merged counts written to {output_file}")
     
-    # ===== Step 11: Collapse miRNAs =====
-    def step11_collapse_mirnas(self):
-        """Collapse multi-mapping miRNAs"""
+    # ===== Step 12: Collapse counts =====
+    def step12_collapse_counts(self):
+        """Sum counts onto gene-level rows (or per-transcript rows in legacy mode)
+
+        Reads are assigned to exactly one transcript ID by step 9, and transcripts of a
+        gene share exons, so which transcript of a gene a read lands on is arbitrary.
+        Summing rows that share a gene name is the meaningful aggregation.
+
+        collapse_level:
+          'gene'       - sum every row sharing a gene name, including across loci
+                         (multi-copy families like Y_RNA/U6 are indistinguishable by
+                         short reads, so their copies merge into one row)
+          'transcript' - legacy behaviour: report one row per transcript, collapsing
+                         only miRBase mature miRNAs, which merge across their loci
+        """
         input_file = os.path.join(self.config['output_dir'], 'counts_molc.txt')
         output_file = os.path.join(self.config['output_dir'], 'counts_molc_final.txt')
-        
-        gene2molc = {}
-        gene2trid = {}
-        
+        level = self.config['collapse_level']
+
+        gene2counts = {}   # gene name -> element-wise summed counts
+        gene2ntx = {}      # gene name -> number of transcript rows summed into it
+        order = []         # first-appearance order, so output is deterministic
+
         with open(output_file, 'w') as outfh:
             for line in open(input_file, 'r'):
                 if line.startswith('#'):
                     outfh.write(line)
-                else:
-                    p = line.strip().split('\t')
-                    genename = p[0]
-                    trans_ids = p[1]
-                    gene2trid[genename] = trans_ids
-                    
-                    if genename.startswith("hsa"):  # miRBase miRNAs
-                        molc_counts = list(map(float, p[2:]))
-                        zeros = [0] * len(molc_counts)
-                        gene2molc[genename] = [i+j for i, j in zip(gene2molc.get(genename, zeros), molc_counts)]
-                    else:
-                        outfh.write(line)
-            
-            # Write collapsed miRNAs
-            for gene in gene2molc:
-                counts_str = '\t'.join([str(round(m, 2)) for m in gene2molc[gene]])
-                outfh.write(f"{gene}\t{gene2trid[gene]}\t{counts_str}\n")
-        
-        logger.info(f"Final counts written to {output_file}")
+                    continue
 
-        # Clean up intermediate file
-        os.remove(input_file)
+                p = line.rstrip('\n').split('\t')
+                genename = p[0]
 
-    # ===== Step 12: Reporting =====
+                collapse = (level == 'gene') or genename.startswith('hsa')
+                if not collapse:
+                    outfh.write(line)
+                    continue
+
+                counts = [float(c) for c in p[2:]]
+                if genename not in gene2counts:
+                    gene2counts[genename] = [0.0] * len(counts)
+                    gene2ntx[genename] = 0
+                    order.append(genename)
+                gene2counts[genename] = [a + b for a, b in zip(gene2counts[genename], counts)]
+                gene2ntx[genename] += 1
+
+            # Column 2 of a collapsed row is the number of transcripts summed into it,
+            # not a transcript ID; uncollapsed rows above keep their real ENST ID.
+            for gene in order:
+                counts_str = '\t'.join(str(round(m, 2)) for m in gene2counts[gene])
+                outfh.write(f"{gene}\t{gene2ntx[gene]}\t{counts_str}\n")
+
+        logger.info(f"Final counts ({level}-level, {len(order)} collapsed rows) "
+                    f"written to {output_file}")
+
+    # ===== Step 13: Reporting =====
     def _write_molecule_counts_custom_content(self, custom_dir):
         """Parse counts_molc_final.txt header lines into a MultiQC custom-content bargraph"""
         counts_file = os.path.join(self.config['output_dir'], 'counts_molc_final.txt')
@@ -911,6 +1124,109 @@ class SmallSeqPipeline:
                 molc_counts[sample] = (a, u)
 
         return molc_counts
+
+    def _write_umi_qc_custom_content(self, custom_dir):
+        """Per-sample UMI health and saturation metrics.
+
+        The Small-seq 5' adapter carries 8 'H' ribonucleotides (A/C/U only), so the UMI space
+        is 3^8 = 6,561 — NOT 4^8. Two things follow, and neither is visible anywhere else:
+
+          * A UMI containing G is impossible by design, so the observed G rate is a direct
+            per-base error-rate readout for that sample.
+          * With only 6,561 barcodes, an abundant small RNA can exhaust the UMI space at a
+            single dedup group (locus x strand x read length). Molecule counts then saturate
+            and undercount the most highly expressed species — worst in the deepest cells,
+            which makes it a library-size-correlated artifact that normalisation won't remove.
+
+        This reports the effect; it deliberately does not correct any counts.
+        """
+        UMI_SPACE = 3 ** 8  # 6,561
+
+        rows = []
+        outfile = os.path.join(custom_dir, 'smallrna_umi_qc_mqc.tsv')
+        for sample in self.samples:
+            fq = os.path.join(self.config['output_dir'], 'step1_umi_removed', sample,
+                              f"{sample}_umiTrim.fq.gz")
+            dedup_bam = os.path.join(self.config['output_dir'], 'step7_dedup', sample,
+                                     f"{sample}_dedup.bam")
+            if not os.path.exists(fq) or not os.path.exists(dedup_bam):
+                logger.warning(f"Missing UMI QC inputs for {sample}, skipping in report")
+                continue
+
+            # --- UMI composition, from the tag umi_tools appended to each read name
+            n_umi = n_with_g = g_bases = tot_bases = 0
+            umi_counts = defaultdict(int)
+            with gzip.open(fq, 'rt') as fh:
+                for i, line in enumerate(fh):
+                    if i % 4:
+                        continue
+                    umi = line.strip().rsplit('_', 1)[-1].split()[0]
+                    if not umi:
+                        continue
+                    n_umi += 1
+                    tot_bases += len(umi)
+                    ng = umi.count('G')
+                    g_bases += ng
+                    if ng:
+                        n_with_g += 1
+                    # Only A/C/T UMIs are real. Anything with a G or an N is a miscall, and
+                    # counting them would push distinct_UMIs above the 6,561 ceiling and
+                    # inflate the diversity estimate.
+                    if not ng and 'N' not in umi:
+                        umi_counts[umi] += 1
+
+            if not n_umi:
+                continue
+
+            # Effective diversity (inverse Simpson). Equals 6,561 only if every UMI is used
+            # equally; T4 RNA ligase sequence bias makes real usage far more skewed, so
+            # collisions -- and therefore undercounting -- happen sooner than nominal.
+            tot = sum(umi_counts.values())
+            u_eff = 1.0 / sum((c / tot) ** 2 for c in umi_counts.values()) if tot else 0.0
+
+            # --- Saturation: molecules per dedup group. Post-dedup, 1 record == 1 molecule,
+            # and each (locus, strand, length) group draws from its own independent UMI space.
+            groups = defaultdict(int)
+            bam = pysam.AlignmentFile(dedup_bam, "rb")
+            for read in bam:
+                if read.is_secondary or read.is_unmapped:
+                    continue
+                groups[(read.reference_id, read.reference_start,
+                        read.is_reverse, read.query_length)] += 1
+            bam.close()
+
+            sizes = sorted(groups.values(), reverse=True) or [0]
+            largest = sizes[0]
+            over25 = sum(1 for s in sizes if s > 0.25 * UMI_SPACE)
+            over50 = sum(1 for s in sizes if s > 0.50 * UMI_SPACE)
+            saturated = "YES" if largest > 0.30 * UMI_SPACE else "no"
+            if saturated == "YES":
+                logger.warning(
+                    f"{sample}: UMI saturation — largest dedup group holds {largest} molecules "
+                    f"({100*largest/UMI_SPACE:.0f}% of the {UMI_SPACE}-UMI space). The most "
+                    f"abundant species in this cell are undercounted.")
+
+            rows.append((sample, 100*g_bases/tot_bases, 100*n_with_g/n_umi,
+                         len(umi_counts), u_eff, largest,
+                         100*largest/UMI_SPACE, over25, over50, saturated))
+
+        with open(outfile, 'w') as fh:
+            fh.write("# id: 'smallrna_umi_qc'\n")
+            fh.write("# section_name: 'SmallSeq UMI QC'\n")
+            fh.write("# description: 'UMI health and saturation. The 5-prime adapter uses 8 H bases "
+                     "(A/C/U), so the UMI space is 3^8 = 6561 and a G in a UMI is always an error. "
+                     "Dedup groups approaching that ceiling have undercounted molecules.'\n")
+            fh.write("# plot_type: 'table'\n")
+            fh.write("# pconfig:\n")
+            fh.write("#     id: 'smallrna_umi_qc_table'\n")
+            fh.write("#     title: 'SmallSeq: UMI QC and Saturation'\n")
+            fh.write("Sample\tpct_G_bases\tpct_UMIs_with_G\tdistinct_UMIs\teff_UMI_diversity\t"
+                     "largest_dedup_group\tpct_of_UMI_space\tgroups_over_25pct\tgroups_over_50pct\tsaturated\n")
+            for r in rows:
+                fh.write(f"{r[0]}\t{r[1]:.2f}\t{r[2]:.2f}\t{r[3]}\t{r[4]:.0f}\t"
+                         f"{r[5]}\t{r[6]:.1f}\t{r[7]}\t{r[8]}\t{r[9]}\n")
+
+        return {r[0]: r[1:] for r in rows}
 
     def _write_filtering_stats_custom_content(self, custom_dir):
         """Aggregate the step5/step8 per-sample stats files into a MultiQC custom-content bargraph"""
@@ -952,7 +1268,7 @@ class SmallSeqPipeline:
 
         return filtering_stats
 
-    def step12_reporting(self):
+    def step13_reporting(self):
         """Aggregate pipeline-specific stats into MultiQC custom content and generate the MultiQC report"""
         output_dir = self.config['output_dir']
         custom_dir = os.path.join(output_dir, 'multiqc_custom')
@@ -960,6 +1276,7 @@ class SmallSeqPipeline:
 
         molc_counts = self._write_molecule_counts_custom_content(custom_dir)
         filtering_stats = self._write_filtering_stats_custom_content(custom_dir)
+        self._write_umi_qc_custom_content(custom_dir)
 
         cmd = f"multiqc {output_dir} -o {output_dir} -n multiqc_report"
         result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
@@ -998,6 +1315,9 @@ def main():
     parser.add_argument('--genome_fasta', help='Reference genome split fasta file directory')
     parser.add_argument('--legacy-count', action='store_true',
                         help='Use midpoint-based read assignment instead of whole-read overlap')
+    parser.add_argument('--collapse-level', choices=['gene', 'transcript'], default='gene',
+                        help='Report counts summed per gene (default), or per transcript with '
+                             'only miRBase miRNAs collapsed (legacy behaviour)')
     parser.add_argument('--reset', action='store_true', help='Reset checkpoint and start from the beginning')
     parser.add_argument('--start-from', help='Start from a specific step (e.g., "STAR Alignment")')
     
@@ -1021,6 +1341,7 @@ def main():
             'max_read_len': args.max_read_len,
             'min_read_len': args.min_read_len,
             'legacy_count': args.legacy_count,
+            'collapse_level': args.collapse_level,
         }
         if args.adapter_file:
             config['adapter_file'] = args.adapter_file
